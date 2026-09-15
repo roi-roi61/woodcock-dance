@@ -1,0 +1,12 @@
+# Build outputs and IDE state
+build/
+.vs/
+*.suo
+*.user
+
+# Local smoke-test copies
+smoke-exe-only/
+
+# Keep release binaries in GitHub Releases rather than the source tree.
+*.exe
+*.zip

@@ -1,0 +1,9 @@
+#include "resource.h"
+
+IDR_WOODCOCK_BASE RCDATA "../assets/woodcock-base.png"
+IDR_VARIANT_BACKPACK RCDATA "../assets/variant-01-backpack.png"
+IDR_VARIANT_SCARF RCDATA "../assets/variant-02-scarf.png"
+IDR_VARIANT_CAFE RCDATA "../assets/variant-03-cafe.png"
+IDR_VARIANT_CLASSIC RCDATA "../assets/variant-04-classic.png"
+IDR_VARIANT_SKATE RCDATA "../assets/variant-05-skate.png"
+IDR_VARIANT_HOVERBOARD RCDATA "../assets/variant-06-hoverboard.png"

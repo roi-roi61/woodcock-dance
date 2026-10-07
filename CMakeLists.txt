@@ -1,6 +1,6 @@
 cmake_minimum_required(VERSION 3.24)
 
-project(WoodcockDance VERSION 0.3.3 LANGUAGES CXX)
+project(WoodcockDance VERSION 0.3.4 LANGUAGES CXX)
 
 add_executable(WoodcockDance WIN32
   src/main.cpp

@@ -1,5 +1,5 @@
-The PNG files in this directory are the project-provided American woodcock
-pixel-art sources. The first file, woodcock-base.png, is the fixed lead
+The PNG files in this directory are American woodcock pixel-art sources created
+by the project owner. The first file, woodcock-base.png, is the fixed lead
 individual. The other six files are used for later flock members.
 
 The runtime preserves the supplied transparent pixels and uses the remaining
@@ -8,8 +8,8 @@ includes these assets, confirm that the project owner has granted
 redistribution and modification permission for the images. The source-code
 MIT license does not automatically change the image rights.
 
-The project-level reuse policy is documented in TERMS.md. It records the
-project owner's intent to allow modification, public release, and
-redistribution of the supplied images without a required credit, but only to
-the extent that the project owner controls or has permission for the relevant
-rights. Third-party image-generation or source-material terms still apply.
+The project-level reuse policy is documented in TERMS.md. It allows
+commercial use, modification, public release, and redistribution of the
+supplied images without a required credit, but only to the extent that the
+project owner controls or has permission for the relevant rights. Third-party
+image-generation or source-material terms still apply.

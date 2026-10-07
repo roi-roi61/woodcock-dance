@@ -10,6 +10,7 @@
 #include <cstdint>
 #include <cstring>
 #include <limits>
+#include <new>
 #include <random>
 #include <string>
 #include <vector>
@@ -44,6 +45,9 @@ constexpr int kBottomMargin = 6;
 constexpr int kMaxBirdCount = 18;
 constexpr int kAssetCount = 7;
 constexpr int kFlockGap = 16;
+constexpr UINT kMaxAssetDimension = 2048;
+constexpr size_t kMaxAssetPixels = 4U * 1024U * 1024U;
+constexpr ULONGLONG kMaxExternalAssetBytes = 16ULL * 1024ULL * 1024ULL;
 
 constexpr std::array<const wchar_t*, kAssetCount> kAssetFiles{
   L"woodcock-base.png",
@@ -94,12 +98,22 @@ struct AnimatedFrame {
   std::vector<BYTE> pixels;
 };
 
-std::wstring ModuleDirectory() {
-  wchar_t buffer[MAX_PATH]{};
-  DWORD length = GetModuleFileNameW(nullptr, buffer, MAX_PATH);
-  if (length == 0) return L".";
+std::wstring ModulePath() {
+  for (DWORD capacity = MAX_PATH; capacity <= 32768; capacity *= 2) {
+    std::vector<wchar_t> buffer(capacity, L'\0');
+    const DWORD length = GetModuleFileNameW(nullptr, buffer.data(), capacity);
+    if (length == 0) return L"";
+    if (length < capacity - 1) {
+      return std::wstring(buffer.data(), length);
+    }
+  }
+  return L"";
+}
 
-  std::wstring path(buffer, length);
+std::wstring ModuleDirectory() {
+  const std::wstring path = ModulePath();
+  if (path.empty()) return L".";
+
   const std::wstring::size_type slash = path.find_last_of(L"\\/");
   return slash == std::wstring::npos ? L"." : path.substr(0, slash);
 }
@@ -155,6 +169,9 @@ bool WriteRegistryDword(const wchar_t* name, DWORD value) {
 bool SetAutoStart(bool enabled) {
   HKEY key = nullptr;
   if (enabled) {
+    const std::wstring modulePath = ModulePath();
+    if (modulePath.empty()) return false;
+
     if (RegOpenKeyExW(
           HKEY_CURRENT_USER,
           L"Software\\Microsoft\\Windows\\CurrentVersion\\Run",
@@ -164,7 +181,12 @@ bool SetAutoStart(bool enabled) {
       return false;
     }
 
-    std::wstring command = L"\"" + ModuleDirectory() + L"\\WoodcockDance.exe\" --autostart";
+    std::wstring command = L"\"" + modulePath + L"\" --autostart";
+    if (command.size() >
+        static_cast<size_t>(std::numeric_limits<DWORD>::max()) / sizeof(wchar_t) - 1U) {
+      RegCloseKey(key);
+      return false;
+    }
     const LONG result = RegSetValueExW(
       key,
       kRunValue,
@@ -177,13 +199,15 @@ bool SetAutoStart(bool enabled) {
     return result == ERROR_SUCCESS;
   }
 
-  if (RegOpenKeyExW(
-        HKEY_CURRENT_USER,
-        L"Software\\Microsoft\\Windows\\CurrentVersion\\Run",
-        0,
-        KEY_SET_VALUE,
-        &key) != ERROR_SUCCESS) {
-    return true;
+  const LONG openResult = RegOpenKeyExW(
+    HKEY_CURRENT_USER,
+    L"Software\\Microsoft\\Windows\\CurrentVersion\\Run",
+    0,
+    KEY_SET_VALUE,
+    &key
+  );
+  if (openResult != ERROR_SUCCESS) {
+    return openResult == ERROR_FILE_NOT_FOUND;
   }
 
   const LONG result = RegDeleteValueW(key, kRunValue);
@@ -221,12 +245,52 @@ BYTE Premultiply(BYTE channel, BYTE alpha) {
   return static_cast<BYTE>((static_cast<unsigned int>(channel) * alpha + 127U) / 255U);
 }
 
+class BitmapLock final {
+public:
+  BitmapLock(Gdiplus::Bitmap& bitmap, Gdiplus::BitmapData& data)
+    : bitmap_(&bitmap), data_(&data) {}
+
+  ~BitmapLock() {
+    if (bitmap_) bitmap_->UnlockBits(data_);
+  }
+
+  BitmapLock(const BitmapLock&) = delete;
+  BitmapLock& operator=(const BitmapLock&) = delete;
+
+private:
+  Gdiplus::Bitmap* bitmap_;
+  Gdiplus::BitmapData* data_;
+};
+
+bool IsExternalAssetUsable(const std::wstring& path) {
+  WIN32_FILE_ATTRIBUTE_DATA attributes{};
+  if (!GetFileAttributesExW(path.c_str(), GetFileExInfoStandard, &attributes)) {
+    return false;
+  }
+  if ((attributes.dwFileAttributes &
+       (FILE_ATTRIBUTE_DIRECTORY | FILE_ATTRIBUTE_REPARSE_POINT)) != 0) {
+    return false;
+  }
+
+  ULARGE_INTEGER fileSize{};
+  fileSize.HighPart = attributes.nFileSizeHigh;
+  fileSize.LowPart = attributes.nFileSizeLow;
+  return fileSize.QuadPart <= kMaxExternalAssetBytes;
+}
+
 bool LoadSpriteFromBitmap(Gdiplus::Bitmap& bitmap, Sprite& result, bool tightCrop) {
   if (bitmap.GetLastStatus() != Gdiplus::Ok) return false;
 
   const UINT sourceWidth = bitmap.GetWidth();
   const UINT sourceHeight = bitmap.GetHeight();
-  if (sourceWidth == 0 || sourceHeight == 0) return false;
+  if (sourceWidth == 0 || sourceHeight == 0 ||
+      sourceWidth > kMaxAssetDimension || sourceHeight > kMaxAssetDimension ||
+      static_cast<size_t>(sourceWidth) > kMaxAssetPixels / sourceHeight) {
+    return false;
+  }
+
+  const size_t pixelCount = static_cast<size_t>(sourceWidth) * sourceHeight;
+  const size_t byteCount = pixelCount * 4U;
 
   Gdiplus::Rect rectangle(0, 0, static_cast<INT>(sourceWidth), static_cast<INT>(sourceHeight));
   Gdiplus::BitmapData data{};
@@ -238,18 +302,32 @@ bool LoadSpriteFromBitmap(Gdiplus::Bitmap& bitmap, Sprite& result, bool tightCro
     return false;
   }
 
-  std::vector<BYTE> pixels(static_cast<size_t>(sourceWidth) * sourceHeight * 4U, 0);
+  BitmapLock lock(bitmap, data);
+  if (data.Scan0 == nullptr || data.Stride == 0 ||
+      data.Stride == std::numeric_limits<int>::min()) {
+    return false;
+  }
+  const size_t rowBytes = static_cast<size_t>(sourceWidth) * 4U;
+  const size_t rowStride = static_cast<size_t>(data.Stride < 0 ? -data.Stride : data.Stride);
+  if (rowStride < rowBytes || rowStride > static_cast<size_t>(kMaxAssetDimension) * 4U) {
+    return false;
+  }
+
+  std::vector<BYTE> pixels;
+  try {
+    pixels.assign(byteCount, 0);
+  } catch (const std::bad_alloc&) {
+    return false;
+  }
   const int stride = data.Stride;
   const BYTE* base = static_cast<const BYTE*>(data.Scan0);
   for (UINT y = 0; y < sourceHeight; ++y) {
     const BYTE* sourceRow = stride >= 0
-      ? base + static_cast<size_t>(y) * static_cast<size_t>(stride)
-      : base + static_cast<size_t>(sourceHeight - 1U - y) * static_cast<size_t>(-stride);
+      ? base + static_cast<size_t>(y) * rowStride
+      : base + static_cast<size_t>(sourceHeight - 1U - y) * rowStride;
     BYTE* destinationRow = pixels.data() + static_cast<size_t>(y) * sourceWidth * 4U;
     std::memcpy(destinationRow, sourceRow, static_cast<size_t>(sourceWidth) * 4U);
   }
-  bitmap.UnlockBits(&data);
-
   constexpr int backgroundRed = 99;
   constexpr int backgroundGreen = 169;
   constexpr int backgroundBlue = 232;
@@ -297,7 +375,12 @@ bool LoadSpriteFromBitmap(Gdiplus::Bitmap& bitmap, Sprite& result, bool tightCro
   const int cropBottom = std::min(static_cast<int>(sourceHeight) - 1, maxY + padding);
   result.width = cropRight - cropX + 1;
   result.height = cropBottom - cropY + 1;
-  result.pixels.assign(static_cast<size_t>(result.width) * result.height * 4U, 0);
+  try {
+    result.pixels.assign(static_cast<size_t>(result.width) * result.height * 4U, 0);
+  } catch (const std::bad_alloc&) {
+    result = {};
+    return false;
+  }
 
   for (int y = 0; y < result.height; ++y) {
     for (int x = 0; x < result.width; ++x) {
@@ -316,8 +399,14 @@ bool LoadSpriteFromBitmap(Gdiplus::Bitmap& bitmap, Sprite& result, bool tightCro
 }
 
 bool LoadSprite(const std::wstring& path, Sprite& result, bool tightCrop) {
-  Gdiplus::Bitmap bitmap(path.c_str(), FALSE);
-  return LoadSpriteFromBitmap(bitmap, result, tightCrop);
+  if (!IsExternalAssetUsable(path)) return false;
+  try {
+    Gdiplus::Bitmap bitmap(path.c_str(), FALSE);
+    return LoadSpriteFromBitmap(bitmap, result, tightCrop);
+  } catch (const std::bad_alloc&) {
+    result = {};
+    return false;
+  }
 }
 
 bool LoadEmbeddedSprite(HINSTANCE instance, int resourceId, Sprite& result, bool tightCrop) {
@@ -348,8 +437,13 @@ bool LoadEmbeddedSprite(HINSTANCE instance, int resourceId, Sprite& result, bool
 
   bool success = false;
   {
-    Gdiplus::Bitmap bitmap(stream, FALSE);
-    success = LoadSpriteFromBitmap(bitmap, result, tightCrop);
+    try {
+      Gdiplus::Bitmap bitmap(stream, FALSE);
+      success = LoadSpriteFromBitmap(bitmap, result, tightCrop);
+    } catch (const std::bad_alloc&) {
+      result = {};
+      success = false;
+    }
   }
   stream->Release();
   return success;
@@ -360,10 +454,18 @@ Sprite ScaleSprite(const Sprite& source, int targetHeight) {
   if (source.width <= 0 || source.height <= 0 || source.pixels.empty()) return result;
 
   result.height = std::max(1, targetHeight);
-  result.width = std::max(1, static_cast<int>(std::lround(
-    static_cast<double>(source.width) * result.height / source.height
-  )));
-  result.pixels.assign(static_cast<size_t>(result.width) * result.height * 4U, 0);
+  const double scaledWidth =
+    static_cast<double>(source.width) * result.height / source.height;
+  if (!std::isfinite(scaledWidth) || scaledWidth < 1.0 ||
+      scaledWidth > static_cast<double>(kMaxAssetDimension)) {
+    return {};
+  }
+  result.width = std::max(1, static_cast<int>(std::lround(scaledWidth)));
+  try {
+    result.pixels.assign(static_cast<size_t>(result.width) * result.height * 4U, 0);
+  } catch (const std::bad_alloc&) {
+    return {};
+  }
 
   for (int y = 0; y < result.height; ++y) {
     const int sourceY = std::min(source.height - 1, y * source.height / result.height);
@@ -624,16 +726,27 @@ private:
     const std::wstring assetDirectory = ModuleDirectory() + L"\\assets\\";
     for (int index = 0; index < kAssetCount; ++index) {
       const std::wstring assetPath = assetDirectory + kAssetFiles[index];
-      if (!LoadSprite(assetPath, sourceSprites_[index], index == 0) &&
-          !LoadEmbeddedSprite(instance_, kAssetResourceIds[index], sourceSprites_[index], index == 0)) {
+      const bool loadedExternal = LoadSprite(assetPath, sourceSprites_[index], index == 0);
+      if (loadedExternal) {
+        scaledSprites_[index] = ScaleSprite(sourceSprites_[index], spriteSize_);
+      }
+      if (!loadedExternal || scaledSprites_[index].pixels.empty()) {
+        if (!LoadEmbeddedSprite(instance_, kAssetResourceIds[index], sourceSprites_[index], index == 0)) {
+          std::wstring message = L"assets\\";
+          message += kAssetFiles[index];
+          message += L"を読み込めませんでした。実行ファイルとassetsフォルダーを同じ場所に置いてください。";
+          MessageBoxW(nullptr, message.c_str(), kApplicationName, MB_OK | MB_ICONERROR);
+          return false;
+        }
+        scaledSprites_[index] = ScaleSprite(sourceSprites_[index], spriteSize_);
+      }
+      if (scaledSprites_[index].pixels.empty()) {
         std::wstring message = L"assets\\";
         message += kAssetFiles[index];
-        message += L"を読み込めませんでした。実行ファイルとassetsフォルダーを同じ場所に置いてください。";
+        message += L"を安全に表示できるサイズへ変換できませんでした。";
         MessageBoxW(nullptr, message.c_str(), kApplicationName, MB_OK | MB_ICONERROR);
         return false;
       }
-      scaledSprites_[index] = ScaleSprite(sourceSprites_[index], spriteSize_);
-      if (scaledSprites_[index].pixels.empty()) return false;
     }
 
     RefreshWorkArea();
@@ -641,6 +754,14 @@ private:
     ConfigureCycle(true, GetTickCount64());
     AddTrayIcon();
     hotKeyRegistered_ = RegisterHotKey(hwnd_, kHotKeyId, MOD_CONTROL | MOD_ALT, 'W') == TRUE;
+    if (!hotKeyRegistered_) {
+      MessageBoxW(
+        nullptr,
+        L"Ctrl+Alt+Wを登録できませんでした。別のアプリが同じショートカットを使用している可能性があります。",
+        kApplicationName,
+        MB_OK | MB_ICONWARNING
+      );
+    }
     SetTimer(hwnd_, kAnimationTimer, kAnimationTimerMs, nullptr);
     Render();
     ShowWindow(hwnd_, SW_SHOWNOACTIVATE);
@@ -660,22 +781,71 @@ private:
       WriteRegistryDword(kRegistrySize, static_cast<DWORD>(spriteSize_));
     }
 
-    DWORD startup = 1;
+    DWORD startup = 0;
     if (!ReadRegistryDword(kRegistryStartup, startup)) {
-      WriteRegistryDword(kRegistryStartup, startup);
+      const int choice = MessageBoxW(
+        nullptr,
+        L"WindowsにログオンしたときにWoodcock Danceを自動起動しますか？\n\n"
+        L"選択は保存され、後からタスクトレイのメニューで変更できます。",
+        kApplicationName,
+        MB_YESNO | MB_ICONQUESTION | MB_DEFBUTTON1
+      );
+      startup = choice == IDYES ? 1U : 0U;
+      const bool startupSaved = SetAutoStart(startup != 0) &&
+        WriteRegistryDword(kRegistryStartup, startup);
+      if (!startupSaved) {
+        MessageBoxW(
+          nullptr,
+          L"自動起動の設定を保存できませんでした。タスクトレイから再試行できます。",
+          kApplicationName,
+          MB_OK | MB_ICONWARNING
+        );
+      }
+    } else if (!SetAutoStart(startup != 0)) {
+      MessageBoxW(
+        nullptr,
+        L"保存済みの自動起動設定を反映できませんでした。",
+        kApplicationName,
+        MB_OK | MB_ICONWARNING
+      );
     }
-    SetAutoStart(startup != 0);
   }
 
-  void RefreshWorkArea() {
+  bool RefreshWorkArea() {
+    const RECT previous = workArea_;
     POINT primary{0, 0};
     HMONITOR monitor = MonitorFromPoint(primary, MONITOR_DEFAULTTOPRIMARY);
     MONITORINFO info{sizeof(info)};
     if (monitor && GetMonitorInfoW(monitor, &info)) {
       workArea_ = info.rcWork;
-      return;
+      return !EqualRect(&previous, &workArea_);
     }
     SystemParametersInfoW(SPI_GETWORKAREA, 0, &workArea_, 0);
+    return !EqualRect(&previous, &workArea_);
+  }
+
+  void ReconfigureCycleForWorkArea(ULONGLONG now) {
+    const double previousElapsed = hidden_
+      ? pausedElapsedMs_
+      : static_cast<double>(CurrentElapsed(now));
+    const ULONGLONG previousDuration = cycleDurationMs_;
+    const double progress = previousDuration == 0
+      ? 0.0
+      : std::clamp(
+          previousElapsed / static_cast<double>(previousDuration),
+          0.0,
+          1.0
+        );
+    if (!RefreshWorkArea()) return;
+
+    ConfigureCycle(false, now);
+    const double newElapsed = progress * static_cast<double>(cycleDurationMs_);
+    if (hidden_) {
+      pausedElapsedMs_ = newElapsed;
+    } else {
+      const ULONGLONG elapsed = static_cast<ULONGLONG>(std::max(0.0, newElapsed));
+      traverseStart_ = now >= elapsed ? now - elapsed : now;
+    }
   }
 
   void RefillVariantPool() {
@@ -800,11 +970,12 @@ private:
       scaledSprites_[index] = ScaleSprite(sourceSprites_[index], spriteSize_);
     }
     ConfigureCycle(false, now);
-    cycleStartX_ = currentX;
+    cycleStartX_ = std::clamp(currentX, cycleStartX_, cycleEndX_);
     cycleDurationMs_ = std::max(
       1ULL,
       static_cast<ULONGLONG>(std::ceil((cycleEndX_ - cycleStartX_) / pixelsPerMs_))
     );
+    if (hidden_) pausedElapsedMs_ = 0.0;
     Render();
   }
 
@@ -946,7 +1117,7 @@ private:
       EndGroupDance();
       return;
     }
-    RefreshWorkArea();
+    ReconfigureCycleForWorkArea(now);
     Render();
   }
 
@@ -987,8 +1158,16 @@ private:
             return 0;
           case kMenuStartup: {
             const bool enabled = !IsAutoStart();
-            SetAutoStart(enabled);
-            WriteRegistryDword(kRegistryStartup, enabled ? 1U : 0U);
+            if (SetAutoStart(enabled) &&
+                WriteRegistryDword(kRegistryStartup, enabled ? 1U : 0U)) {
+              return 0;
+            }
+            MessageBoxW(
+              nullptr,
+              L"自動起動の設定を変更できませんでした。",
+              kApplicationName,
+              MB_OK | MB_ICONWARNING
+            );
             return 0;
           }
           case kMenuExit:
@@ -1001,7 +1180,7 @@ private:
       case WM_DISPLAYCHANGE:
       case WM_SETTINGCHANGE:
       case WM_DPICHANGED:
-        RefreshWorkArea();
+        ReconfigureCycleForWorkArea(GetTickCount64());
         Render();
         return 0;
       case kTrayMessage:
